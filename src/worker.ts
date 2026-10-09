@@ -1,6 +1,8 @@
 export interface Env {
   AI: any;
   VECTORIZE_INDEX: VectorizeIndex;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_EMBEDDING_MODEL?: string;
 }
 
 export interface ClefResponse {
@@ -17,10 +19,10 @@ export interface ClefResponse {
 }
 
 /**
- * FOKUS 1 & 2: Smart Intent Routing & Pre-Retrieval Guardrails
- * Menggunakan @cf/cloudflare/clef-flash dalam 1 forward pass untuk memeriksa:
- * 1. Guardrail keamanan (noul): deteksi prompt injection / jailbreak
- * 2. Intent routing (choice): membedakan chitchat, support, atau technical_rag
+ * FOCUS 1 & 2: Smart Intent Routing & Pre-Retrieval Guardrails
+ * Uses @cf/cloudflare/clef-flash in a single forward pass to evaluate:
+ * 1. Security Guardrail (noul): Detects prompt injection, jailbreak attempts, or unsafe commands.
+ * 2. Intent Routing (choice): Classifies query into "chitchat", "support", or "technical_rag".
  */
 export async function routeAndGuardQuery(
   ai: any,
@@ -44,9 +46,12 @@ export async function routeAndGuardQuery(
         type: "choice",
         instructions: "What is the primary intent of this user query?",
         criteria: {
-          chitchat: "Casual greeting, small talk, pleasantries, or non-technical conversation.",
-          support: "Customer support inquiry, account issues, or general help desk requests.",
-          technical_rag: "Technical question requiring lookup in documentation, architecture guides, or knowledge base.",
+          chitchat:
+            "Casual greeting, small talk, pleasantries, or non-technical conversation.",
+          support:
+            "Customer support inquiry, account issues, or general help desk requests.",
+          technical_rag:
+            "Technical question requiring lookup in documentation, architecture guides, or knowledge base.",
         },
       },
     },
@@ -57,7 +62,8 @@ export async function routeAndGuardQuery(
     response.answers?.is_unsafe?.probability ??
     0;
 
-  const isUnsafe = unsafeProb > 0.85; // Drop request jika probabilitas unsafe > 85%
+  // Drop request if unsafe probability is greater than 85% (>0.85)
+  const isUnsafe = unsafeProb > 0.85;
   const intent = response.answers?.intent?.choice || "technical_rag";
   const intentConfidence = response.answers?.intent?.confidence || 0;
 
@@ -70,9 +76,9 @@ export async function routeAndGuardQuery(
 }
 
 /**
- * FOKUS 3: Metadata Extraction untuk Vectorize DB
- * Mengklasifikasikan query ke dalam kategori dokumen ("billing", "api_docs", "general_policy")
- * agar query Vectorize dapat dipersempit menggunakan metadata filter.
+ * FOCUS 3: Metadata Extraction for Vectorize DB
+ * Categorizes user query into document categories ("billing", "api_docs", "general_policy")
+ * to narrow down vector search via metadata filtering.
  */
 export async function extractCategoryFilter(
   ai: any,
@@ -86,9 +92,12 @@ export async function extractCategoryFilter(
         type: "choice",
         instructions: "Which documentation category is this query asking about?",
         criteria: {
-          billing: "Questions regarding pricing, invoices, subscription tiers, and payment methods.",
-          api_docs: "Questions regarding endpoints, SDKs, parameters, authentication, and technical APIs.",
-          general_policy: "Terms of service, privacy policies, compliance, and general usage guidelines.",
+          billing:
+            "Questions regarding pricing, invoices, subscription tiers, and payment methods.",
+          api_docs:
+            "Questions regarding endpoints, SDKs, parameters, authentication, and technical APIs.",
+          general_policy:
+            "Terms of service, privacy policies, compliance, and general usage guidelines.",
         },
       },
     },
@@ -98,16 +107,15 @@ export async function extractCategoryFilter(
 }
 
 /**
- * FOKUS 4: Post-Retrieval Validation (Mencegah Halusinasi LLM)
- * Memverifikasi apakah kumpulan dokumen yang ditarik dari Vectorize memuat fakta
- * yang memadai untuk menjawab pertanyaan user.
+ * FOCUS 4: Post-Retrieval Validation (Anti-Hallucination)
+ * Evaluates whether retrieved document chunks contain sufficient factual ground truth
+ * to answer the user query completely before invoking the System 2 LLM.
  */
 export async function validateRetrievedContext(
   ai: any,
   userQuery: string,
   retrievedContext: string
 ): Promise<{ hasSufficientFacts: boolean; probability: number }> {
-  // Gabungkan query user dan teks context hasil retrieve
   const combinedState = `User Question:\n${userQuery}\n\nRetrieved Documents:\n${retrievedContext}`;
 
   const response: ClefResponse = await ai.run("@cf/cloudflare/clef-flash", {
@@ -127,11 +135,51 @@ export async function validateRetrievedContext(
     response.answers?.sufficient_facts?.probability ??
     0;
 
-  // Jika probabilitas "yes" >= 0.5, berarti context memadai
   return {
     hasSufficientFacts: prob >= 0.5,
     probability: prob,
   };
+}
+
+/**
+ * Generates embedding vector matching the dimensions of the Vectorize index.
+ * - If OPENROUTER_API_KEY is configured: Uses text-embedding-3-small (1536 dimensions)
+ * - Otherwise: Uses Workers AI @cf/baai/bge-base-en-v1.5 (768 dimensions)
+ */
+async function generateQueryEmbedding(
+  ai: any,
+  userQuery: string,
+  env: Env
+): Promise<number[]> {
+  if (env.OPENROUTER_API_KEY) {
+    const model = env.OPENROUTER_EMBEDDING_MODEL || "text-embedding-3-small";
+    const res = await fetch("https://openrouter.ai/api/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/fajarbc/rag-cloudflare",
+        "X-Title": "RAG Cloudflare",
+      },
+      body: JSON.stringify({
+        model: model,
+        input: userQuery,
+      }),
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as any;
+      if (data.data?.[0]?.embedding) {
+        return data.data[0].embedding;
+      }
+    }
+  }
+
+  // Native Workers AI embedding (768 dimensions)
+  const embeddingResponse = await ai.run("@cf/baai/bge-base-en-v1.5", {
+    text: [userQuery],
+  });
+  return embeddingResponse.data[0];
 }
 
 export default {
@@ -158,27 +206,29 @@ export default {
       }
 
       // =========================================================================
-      // [FOKUS 1 & 2]: Intent Routing & Pre-Retrieval Guardrails (Clef-Flash)
+      // [FOCUS 1 & 2]: Intent Routing & Pre-Retrieval Guardrails (Clef-Flash)
       // =========================================================================
       const routeCheck = await routeAndGuardQuery(env.AI, userQuery);
 
-      // FOKUS 2: Guardrail - Drop request jika potensi prompt injection / unsafe > 85%
+      // FOCUS 2: Security Guardrail - Drop request if unsafe probability > 85%
       if (routeCheck.isUnsafe) {
         return new Response(
           JSON.stringify({
-            error: "Security Alert: Permintaan Anda ditolak karena terdeteksi potensi prompt injection atau perintah tidak aman.",
+            error:
+              "Security Alert: Permintaan Anda ditolak karena terdeteksi potensi prompt injection atau instruksi yang tidak aman.",
             unsafe_probability: routeCheck.unsafeProbability,
           }),
           { status: 400, headers: { "Content-Type": "application/json" } }
         );
       }
 
-      // FOKUS 1: Intent Routing
+      // FOCUS 1: Intent Routing - Early return for non-technical queries
       if (routeCheck.intent === "chitchat") {
         return new Response(
           JSON.stringify({
             intent: "chitchat",
-            answer: "Halo! Saya adalah asisten dokumentasi Cloudflare. Ada yang bisa saya bantu seputar API, billing, atau panduan teknis kami?",
+            answer:
+              "Halo! Saya adalah asisten dokumentasi Cloudflare. Ada yang bisa saya bantu seputar API, billing, atau panduan teknis kami?",
             routed_by: "clef-flash",
           }),
           { headers: { "Content-Type": "application/json" } }
@@ -189,7 +239,8 @@ export default {
         return new Response(
           JSON.stringify({
             intent: "support",
-            answer: "Untuk bantuan akun atau eskalasi tiket bantuan, silakan hubungi tim support kami melalui portal dukungan resmi.",
+            answer:
+              "Untuk bantuan akun atau eskalasi tiket bantuan, silakan hubungi tim support kami melalui portal dukungan resmi.",
             routed_by: "clef-flash",
           }),
           { headers: { "Content-Type": "application/json" } }
@@ -197,18 +248,15 @@ export default {
       }
 
       // =========================================================================
-      // [FOKUS 3]: Metadata Extraction untuk Vectorize DB
+      // [FOCUS 3]: Metadata Extraction for Vectorize DB
       // =========================================================================
       const selectedCategory = await extractCategoryFilter(env.AI, userQuery);
 
-      // 1. Generate embedding untuk query menggunakan Workers AI
-      const embeddingResponse = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
-        text: [userQuery],
-      });
-      const queryVector = embeddingResponse.data[0];
+      // Generate query embedding vector
+      const queryVector = await generateQueryEmbedding(env.AI, userQuery, env);
 
-      // 2. Query Vectorize Index dengan Metadata Filter
-      const vectorizeResults = await env.VECTORIZE_INDEX.query(queryVector, {
+      // Query Vectorize Index with category metadata filter
+      let vectorizeResults = await env.VECTORIZE_INDEX.query(queryVector, {
         topK: 5,
         filter: {
           category: { $eq: selectedCategory },
@@ -216,13 +264,22 @@ export default {
         returnMetadata: "all",
       });
 
+      // Fallback: If no matches found with category filter (e.g., vectors ingested without category metadata),
+      // perform query without filter to prevent false negative retrieval
+      if (!vectorizeResults.matches || vectorizeResults.matches.length === 0) {
+        vectorizeResults = await env.VECTORIZE_INDEX.query(queryVector, {
+          topK: 5,
+          returnMetadata: "all",
+        });
+      }
+
       const matches = vectorizeResults.matches || [];
       const retrievedDocs = matches
         .map((m: any) => m.metadata?.text || "")
         .filter((t: string) => t.length > 0)
         .join("\n\n---\n\n");
 
-      // Jika tidak ada dokumen yang cocok dari Vectorize
+      // If no relevant documents found in index
       if (!retrievedDocs || matches.length === 0) {
         return new Response(
           JSON.stringify({
@@ -235,7 +292,7 @@ export default {
       }
 
       // =========================================================================
-      // [FOKUS 4]: Post-Retrieval Validation (Anti-Halusinasi dengan Clef-Flash)
+      // [FOCUS 4]: Post-Retrieval Validation (Anti-Hallucination via Clef-Flash)
       // =========================================================================
       const validation = await validateRetrievedContext(
         env.AI,
@@ -243,7 +300,7 @@ export default {
         retrievedDocs
       );
 
-      // Jika Clef menilai context tidak memuat fakta yang memadai (no)
+      // If Clef determines retrieved context lacks sufficient facts, bypass System 2 LLM
       if (!validation.hasSufficientFacts) {
         return new Response(
           JSON.stringify({
