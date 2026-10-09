@@ -1,0 +1,6 @@
+# Local development environment variables for Wrangler (wrangler dev)
+# Copy this file to .dev.vars: cp .dev.vars.example .dev.vars
+
+# Set your OpenRouter API key to query the 1536-dimensional Vectorize index:
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_EMBEDDING_MODEL=text-embedding-3-small
