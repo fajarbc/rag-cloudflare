@@ -2,7 +2,9 @@
 
 A Retrieval-Augmented Generation (RAG) architecture built with Cloudflare Workers, Vectorize, and Workers AI.
 
-In this branch (`feature/clef-flash-integration`), we integrate **Cloudflare Clef-Flash (`@cf/cloudflare/clef-flash`)** as a fast **System 1 Decision Gateway** protecting, routing, and filtering context before reaching the System 2 generative LLM (Llama 3.1).
+In this branch (`feature/clef-flash-integration`):
+- **System 1 (Decision Engine):** Powered by Cloudflare Clef-Flash (`@cf/cloudflare/clef-flash`) via Workers AI (`env.AI`). It acts as a lightweight, low-latency gateway protecting the pipeline, categorizing requests, and evaluating factual sufficiency.
+- **System 2 (Generative LLM & Embeddings):** Powered by standard REST API calls to your configured provider (OpenRouter, OpenAI, Groq, etc.) using credentials and models defined in `.env`. No model names are hardcoded.
 
 ---
 
@@ -14,6 +16,7 @@ User Query
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ [Focus 1 & 2] Clef-Flash: Intent & Pre-Retrieval Guardrail   │
+│  - Powered by: env.AI (@cf/cloudflare/clef-flash)           │
 │  - Guardrail (noul): Drop prompt injection (>85% prob)      │
 │  - Intent (choice):  "chitchat"      -> Fast static reply   │
 │                      "support"       -> Redirect to support │
@@ -23,6 +26,7 @@ User Query
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ [Focus 3] Clef-Flash: Metadata Category Extraction          │
+│  - Powered by: env.AI (@cf/cloudflare/clef-flash)           │
 │  - Category (choice): "billing", "api_docs", "policy"       │
 │  - Vectorize Query with filter: { category: { $eq } }       │
 └──────────────────────────────┬──────────────────────────────┘
@@ -30,11 +34,13 @@ User Query
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Cloudflare Vectorize: Retrieve Top-K Matching Chunks         │
+│  - Embedding generated via standard REST (from .env)        │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ [Focus 4] Clef-Flash: Post-Retrieval Validation             │
+│  - Powered by: env.AI (@cf/cloudflare/clef-flash)           │
 │  - Fact check (noul): Do docs contain sufficient facts?     │
 │  - If No  -> Bypass LLM, return "Information not available" │
 │  - If Yes -> Proceed to System 2                            │
@@ -42,8 +48,9 @@ User Query
                                │ (Yes)
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ System 2: Workers AI Llama 3.1 8B Instruct                  │
-│ Generates grounded, hallucination-free final response       │
+│ System 2: Generative LLM (OpenRouter / External Provider)   │
+│  - Powered by standard REST API configured via .env         │
+│  - Generates grounded, hallucination-free final response    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -53,7 +60,41 @@ User Query
 
 - [Bun](https://bun.sh/) (1.0+) or Node.js (18+)
 - Cloudflare Account ID & API Token
-- OpenRouter API Key (for 1536-dimension embeddings)
+- OpenRouter API Key (or any OpenAI-compatible provider)
+
+---
+
+## Environment Configuration (`.env`)
+
+A single `.env` file is used across both the Bun ingestion scripts and Wrangler local development (`wrangler dev`).
+
+Copy `.env.example` to `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Configure your parameters in `.env`:
+
+```env
+# Provider REST API Configuration (Embeddings & System 2 Generative LLM)
+OPENROUTER_API_BASE=https://openrouter.ai/api/v1
+OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_MODEL=deepseek/deepseek-v4-pro
+OPENROUTER_CONTEXT_MODEL=gpt-4o-mini
+OPENROUTER_MAX_TOKENS=512
+OPENROUTER_EMBEDDING_MODEL=text-embedding-3-small
+
+# Cloudflare Configuration
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
+CLOUDFLARE_VECTORIZE_INDEX=belajar-rag
+
+# System 1 Decision Model (Runs natively on Cloudflare Workers AI)
+CLEF_MODEL=@cf/cloudflare/clef-flash
+```
+
+> **Note on Model Flexibility:** No model names or provider endpoints are hardcoded in the source code. You can switch the embedding model, LLM model, or provider API base simply by updating your `.env`.
 
 ---
 
@@ -64,55 +105,11 @@ User Query
    bun install
    ```
 
-2. **Configure environment variables:**
-   - For ingestion scripts (`ingest.js`):
-     ```bash
-     cp .env.example .env
-     ```
-     Fill in your credentials in `.env`.
-   - For local Worker development (`wrangler dev`):
-     ```bash
-     cp .dev.vars.example .dev.vars
-     ```
-     Add your `OPENROUTER_API_KEY` to `.dev.vars`.
-
-3. **Create Vectorize Metadata Index (for Focus 3):**
+2. **Create Vectorize Metadata Index (for Focus 3):**
    To filter vector queries by document category, enable the metadata index for `category`:
    ```bash
    npx wrangler vectorize create-metadata-index belajar-rag --property-name=category --type=string
    ```
-
----
-
-## Understanding Vector Dimensions (1536 vs 768)
-
-If you encounter:
-```text
-VECTOR_QUERY_ERROR (code = 40006): invalid query vector, expected 1536 dimensions, and got 768 dimensions
-```
-This occurs because the Vectorize index was initialized with **1536 dimensions** (using `text-embedding-3-small`), but the query used a **768-dimension** model (`@cf/baai/bge-base-en-v1.5`).
-
-You can choose either of the following configurations:
-
-### Approach A: 1536 Dimensions (Default)
-- **Ingestion:** Uses `text-embedding-3-small` via OpenRouter (1536 dims).
-- **Worker:** Reads `OPENROUTER_API_KEY` from `.dev.vars` (or Wrangler secrets) and queries the 1536-dim index seamlessly.
-- **Run Ingestion:**
-  ```bash
-  bun ingest.js
-  ```
-
-### Approach B: Pure Cloudflare Native (768 Dimensions)
-- If you prefer 100% native Cloudflare Workers AI embeddings without external API keys:
-  1. Re-create the index with 768 dimensions:
-     ```bash
-     npx wrangler vectorize create belajar-rag --dimensions=768 --metric=cosine
-     ```
-  2. Ingest PDFs using Workers AI embeddings:
-     ```bash
-     bun ingest.js --workers-ai
-     ```
-  3. The Worker automatically falls back to native `@cf/baai/bge-base-en-v1.5` when `OPENROUTER_API_KEY` is omitted.
 
 ---
 
@@ -121,21 +118,25 @@ You can choose either of the following configurations:
 Place your PDF documents in the `data/` folder:
 
 ```bash
-# Ingest with default 1536-dim embeddings
+# Ingest PDF documents
 bun ingest.js
 
 # Or reset existing vectors and re-ingest fresh data
 bun ingest.js --delete-old
 ```
 
-`ingest.js` automatically assigns metadata categories (`api_docs`, `billing`, `general_policy`) based on file paths and contents, which are indexed in Vectorize for Focus 3 filtering.
+`ingest.js` automatically:
+1. Splits PDF pages into overlapping chunks.
+2. Infers the `category` metadata (`api_docs`, `billing`, `general_policy`).
+3. Generates embeddings via the configured provider in `.env` (`OPENROUTER_EMBEDDING_MODEL`, e.g., 1536 dimensions).
+4. Upserts vectors and metadata into the Cloudflare Vectorize index.
 
 ---
 
 ## Running the Worker
 
-### Local Development (Remote Binding)
-Because Workers AI (`clef-flash`, `llama-3.1`) and Vectorize execute on Cloudflare GPUs, start Wrangler with `--remote`:
+### Local Development
+Wrangler natively loads your `.env` file. Start the local server connected to Cloudflare GPUs with `--remote`:
 
 ```bash
 npx wrangler dev --remote
@@ -145,10 +146,10 @@ The Worker will be accessible at `http://localhost:8787`.
 
 ### Production Deployment
 ```bash
-# Set secret for production (if using 1536-dim OpenRouter embeddings)
+# Upload sensitive secrets to Cloudflare
 npx wrangler secret put OPENROUTER_API_KEY
 
-# Deploy to Cloudflare edge network
+# Deploy worker
 npx wrangler deploy
 ```
 
@@ -157,7 +158,7 @@ npx wrangler deploy
 ## Testing the 4 Focus Areas
 
 ### 1. Focus 1: Intent Routing (Chitchat)
-Non-technical queries receive instant static responses without triggering Vectorize or Llama 3:
+Non-technical queries receive instant static responses from Clef without triggering Vectorize or the System 2 LLM:
 ```bash
 curl -X POST http://localhost:8787 \
   -H "Content-Type: application/json" \
@@ -173,7 +174,7 @@ curl -i -X POST http://localhost:8787 \
 ```
 
 ### 3. Focus 3: Metadata Extraction & Vector Search
-Technical queries are classified into a category (`api_docs`, `billing`, `general_policy`), filtering the Vectorize index search:
+Queries are classified by Clef into a category (`api_docs`, `billing`, `general_policy`), filtering the Vectorize index search:
 ```bash
 curl -X POST http://localhost:8787 \
   -H "Content-Type: application/json" \
@@ -181,7 +182,7 @@ curl -X POST http://localhost:8787 \
 ```
 
 ### 4. Focus 4: Post-Retrieval Validation (Anti-Hallucination)
-When retrieved documents do not contain sufficient facts to answer the question, Clef bypasses System 2 LLM:
+When retrieved documents do not contain sufficient facts to answer the question, Clef bypasses the System 2 LLM:
 ```bash
 curl -X POST http://localhost:8787 \
   -H "Content-Type: application/json" \
