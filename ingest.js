@@ -53,27 +53,6 @@ function inferCategory(fileName, text = '') {
   return 'api_docs';
 }
 
-/**
- * Generate embedding using Workers AI REST API (768 dimensions)
- */
-async function getWorkersAIEmbedding(text) {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${config.cloudflare.accountId}/ai/run/@cf/baai/bge-base-en-v1.5`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.cloudflare.apiToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ text: [text] }),
-  });
-
-  const data = await response.json();
-  if (!data.success) {
-    throw new Error(`Workers AI Embedding error: ${JSON.stringify(data.errors)}`);
-  }
-  return data.result.data[0];
-}
-
 async function loadPdfDocuments(inputDir = './data') {
   const documents = [];
   const dataDir = path.resolve(inputDir);
@@ -114,9 +93,8 @@ async function loadPdfDocuments(inputDir = './data') {
 
 async function main() {
   try {
-    const useWorkersAI = process.argv.includes('--workers-ai');
     console.log(`Starting ingestion pipeline...`);
-    console.log(`Embedding provider: ${useWorkersAI ? 'Cloudflare Workers AI (768 dims)' : 'OpenRouter text-embedding-3-small (1536 dims)'}`);
+    console.log(`Embedding model: ${config.openrouter.embeddingModel} (via ${config.openrouter.apiBase})`);
 
     console.log('Loading PDF documents from ./data...');
     const documents = await loadPdfDocuments();
@@ -147,9 +125,8 @@ async function main() {
         const chunkText = chunks[i];
         console.log(`Embedding chunk ${i + 1}/${chunks.length} from ${doc.metadata.file_name} (Category: ${doc.metadata.category})...`);
 
-        const embedding = useWorkersAI
-          ? await getWorkersAIEmbedding(chunkText)
-          : await getEmbedding(chunkText);
+        // Standard REST embedding from configured provider
+        const embedding = await getEmbedding(chunkText);
 
         const vectorId = crypto
           .createHash('sha256')
@@ -165,7 +142,7 @@ async function main() {
             file_name: doc.metadata.file_name,
             page_number: doc.metadata.page_number,
             chunk_index: i,
-            category: doc.metadata.category, // Focus 3: Included for Vectorize metadata filtering
+            category: doc.metadata.category, // Focus 3: Used for Vectorize metadata filtering
           },
         });
       }
