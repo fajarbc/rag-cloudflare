@@ -11,8 +11,5 @@
       "binding": "VECTORIZE_INDEX",
       "index_name": "belajar-rag"
     }
-  ],
-  "vars": {
-    "OPENROUTER_EMBEDDING_MODEL": "text-embedding-3-small"
-  }
+  ]
 }
